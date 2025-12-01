@@ -1,6 +1,6 @@
-# EPUB Cleaner
+# Document Cleaner
 
-A pragmatic, DHH-style Python tool for batch cleaning Markdown files converted from EPUBs.
+A pragmatic, DHH-style Python tool for batch cleaning Markdown files converted from EPUBs and PDF documents.
 
 ## Philosophy: Factory vs. Showroom
 
