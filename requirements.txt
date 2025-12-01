@@ -1,0 +1,4 @@
+pdfminer.six
+# Optional for OCR
+pytesseract
+pdf2image

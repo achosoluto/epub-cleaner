@@ -75,6 +75,8 @@ Example usage:
 
 from __future__ import annotations
 
+__version__ = "0.2.0"
+
 import argparse
 import csv
 import hashlib
@@ -84,9 +86,21 @@ import re
 import sys
 import time
 import unicodedata
+import tempfile
+import shutil
+import pdf_to_md
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Iterable, List, Tuple, Optional
+
+import logging
+# Optional future EPUB spec validator (currently a stub for future use)
+try:
+    from epub_spec_validator import validate_epub
+except ImportError:
+    # If the validator module is not present, define a no-op placeholder
+    def validate_epub(path: str, strict: bool = False) -> dict:
+        return {"ok": True, "messages": ["Validator not available; skipping."]}
 
 
 DEFAULT_INPUT_DIR = "."
@@ -136,6 +150,7 @@ _block_quote_re = re.compile(r"(?m)^\s{0,3}>\s?")
 _html_tag_re = re.compile(r"</?[A-Za-z][^>]*>")
 # Emphasis markers (bold/italic/strike)
 _emphasis_re = re.compile(r"[*_~]{1,3}")
+
 
 def _normalize_text_for_compare(text: str) -> str:
     """
@@ -227,7 +242,9 @@ def _sha256_hex(s: str) -> str:
 # =========================
 
 # Specific HTML container tags to drop (preserve inner text)
-_container_tag_re = re.compile(r"</?(?:div|span|font|section|article|header|footer|nav)\b[^>]*>", re.IGNORECASE)
+_container_tag_re = re.compile(
+    r"</?(?:div|span|font|section|article|header|footer|nav)\b[^>]*>", re.IGNORECASE
+)
 # HTML comments
 _html_comment_any_re = re.compile(r"<!--.*?-->", re.DOTALL)
 # Images to alt
@@ -238,6 +255,7 @@ _link_inline_clean_re = _link_inline_re
 _link_ref_clean_re = _link_ref_re
 # Link reference definitions
 _link_ref_def_clean_re = _link_ref_def_re
+
 
 def clean_markdown_conservative(md: str) -> str:
     """
@@ -285,6 +303,7 @@ def clean_markdown_conservative(md: str) -> str:
 # Diff: token-level with context
 # =========================
 
+
 def token_diff_with_context(a_text: str, b_text: str, context: int) -> List[str]:
     """
     Create a token-level diff with symmetric context around changes.
@@ -299,7 +318,9 @@ def token_diff_with_context(a_text: str, b_text: str, context: int) -> List[str]
 
     lines: List[str] = []
     # Group opcodes around changes. We'll use a small grouping and then trim context per opcode.
-    grouped = _group_opcodes_with_token_context(sm.get_opcodes(), context, len(a_tokens), len(b_tokens))
+    grouped = _group_opcodes_with_token_context(
+        sm.get_opcodes(), context, len(a_tokens), len(b_tokens)
+    )
 
     for block in grouped:
         # Add a separator between change blocks for readability
@@ -331,10 +352,7 @@ def token_diff_with_context(a_text: str, b_text: str, context: int) -> List[str]
 
 
 def _group_opcodes_with_token_context(
-    opcodes: List[Tuple[str, int, int, int, int]],
-    ctx: int,
-    a_len: int,
-    b_len: int
+    opcodes: List[Tuple[str, int, int, int, int]], ctx: int, a_len: int, b_len: int
 ) -> List[List[Tuple[str, int, int, int, int]]]:
     """
     Group opcodes around changes and include up to 'ctx' tokens of equal context
@@ -356,15 +374,22 @@ def _group_opcodes_with_token_context(
             group_end += 1
 
         # Determine token context from surrounding equals
-        pre_equal = opcodes[group_start - 1] if group_start - 1 >= 0 and opcodes[group_start - 1][0] == "equal" else None
-        post_equal = opcodes[group_end + 1] if group_end + 1 < n and opcodes[group_end + 1][0] == "equal" else None
+        pre_equal = (
+            opcodes[group_start - 1]
+            if group_start - 1 >= 0 and opcodes[group_start - 1][0] == "equal"
+            else None
+        )
+        post_equal = (
+            opcodes[group_end + 1]
+            if group_end + 1 < n and opcodes[group_end + 1][0] == "equal"
+            else None
+        )
 
         block: List[Tuple[str, int, int, int, int]] = []
 
         # Pre-context
         if pre_equal:
             _, pi1, pi2, pj1, pj2 = pre_equal
-            pi2_trim = min(pi2, pi2)  # no-op, for clarity
             # last ctx tokens of pre-context
             a_start = max(pi2 - ctx, pi1)
             b_start = max(pj2 - ctx, pj1)
@@ -402,6 +427,7 @@ def _trim_tokens(tokens: List[str], ctx: int) -> List[str]:
 # Manager: batch workflow
 # =========================
 
+
 @dataclass
 class FileResult:
     file_path: str
@@ -416,15 +442,17 @@ class FileResult:
     diff_path: str
 
 
-def find_markdown_files(root: str, exclude_dirs: Iterable[str]) -> List[str]:
+def find_input_files(
+    md_root: str, pdf_root: str, exclude_dirs: Iterable[str]
+) -> Tuple[List[str], List[str]]:
     """
-    Recursively find .md files under root, excluding directory names in exclude_dirs.
-    Returns sorted list of file paths (relative to root passed in, but we emit absolute/normalized later).
+    Recursively find .md files under md_root and .pdf files under pdf_root, excluding directory names in exclude_dirs.
+    Returns sorted lists of file paths as (md_files, pdf_files).
     """
     # Normalize exclude dir names to a set (compare by dir base name)
     exclude_set = set(exclude_dirs)
-    results: List[str] = []
-    for cur_dir, dirs, files in os.walk(root):
+    md_files: List[str] = []
+    for cur_dir, dirs, files in os.walk(md_root):
         # Prune excluded directories
         pruned = []
         for d in list(dirs):
@@ -436,10 +464,27 @@ def find_markdown_files(root: str, exclude_dirs: Iterable[str]) -> List[str]:
 
         for f in files:
             if f.lower().endswith(".md"):
-                results.append(os.path.join(cur_dir, f))
+                md_files.append(os.path.join(cur_dir, f))
 
-    results.sort()
-    return results
+    md_files.sort()
+
+    pdf_files: List[str] = []
+    for cur_dir, dirs, files in os.walk(pdf_root):
+        # Prune excluded directories
+        pruned = []
+        for d in list(dirs):
+            if d in exclude_set:
+                # Skip this directory
+                continue
+            pruned.append(d)
+        dirs[:] = pruned
+
+        for f in files:
+            if f.lower().endswith(".pdf"):
+                pdf_files.append(os.path.join(cur_dir, f))
+
+    pdf_files.sort()
+    return md_files, pdf_files
 
 
 def ensure_parent_dir(path: str) -> None:
@@ -471,7 +516,7 @@ def process_file(
     args: argparse.Namespace,
     input_root: str,
     out_root: str,
-    diffs_root: str
+    diffs_root: str,
 ) -> FileResult:
     """
     Process a single markdown file end-to-end.
@@ -487,7 +532,33 @@ def process_file(
     tokens_result = 0
 
     try:
+        # Safe relative path calculation:
+        # If src_path is not under input_root (e.g. temp file from PDF conversion),
+        # use basename to avoid writing to temp dirs or outside output_root.
+        try:
+            abs_src = os.path.abspath(src_path)
+            abs_input = os.path.abspath(input_root)
+            if abs_src.startswith(abs_input):
+                rel_src = os.path.relpath(src_path, input_root)
+            else:
+                rel_src = os.path.basename(src_path)
+        except Exception:
+            rel_src = os.path.basename(src_path)
+
         original = read_text_file(src_path, args.encoding)
+
+        # Optional EPUB spec validation (future feature)
+        if args.strict_epub and src_path.lower().endswith(".epub"):
+            validation = validate_epub(src_path, strict=True)
+            if not validation.get("ok", False):
+                status = "failed"
+                reason = "epub_spec_validation_failed"
+                # Record messages in diff_path for visibility
+                diff_path = None
+                # Skip further processing for this file
+                raise Exception(
+                    f"EPUB spec validation failed: {validation.get('messages', [])}"
+                )
 
         # Baseline normalized
         norm_base = _normalize_text_for_compare(original)
@@ -509,20 +580,24 @@ def process_file(
             status = "failed"
             reason = "content_changed"
             # Produce token-level diff of normalized forms
-            rel_src = relative_to(src_path, input_root)
-            dst_diff_path = os.path.join(diffs_root, os.path.splitext(rel_src)[0] + ".txt")
-            diff_lines = token_diff_with_context(norm_base, norm_result, args.diff_context)
+            # rel_src calculated at start of try block
+            dst_diff_path = os.path.join(
+                diffs_root, os.path.splitext(rel_src)[0] + ".txt"
+            )
+            diff_lines = token_diff_with_context(
+                norm_base, norm_result, args.diff_context
+            )
             diff_text = "\n".join(diff_lines) + "\n"
             write_text_file(dst_diff_path, diff_text, args.encoding)
             diff_path = dst_diff_path
 
         # Idempotence check
         cleaned_twice = clean_markdown_conservative(cleaned_once)
-        idempotent = (cleaned_twice == cleaned_once)
+        idempotent = cleaned_twice == cleaned_once
 
         # Write cleaned output only on success and if not dry-run
         if status == "success" and not args.dry_run:
-            rel_src = relative_to(src_path, input_root)
+            # rel_src calculated at start of try block
             base, ext = os.path.splitext(rel_src)
             dst_rel = f"{base}{args.suffix}{ext}"
             dst_path = os.path.join(out_root, dst_rel)
@@ -549,7 +624,9 @@ def process_file(
     )
 
 
-def write_report(report_path: str, results: List[FileResult], input_root: str, encoding: str) -> None:
+def write_report(
+    report_path: str, results: List[FileResult], input_root: str, encoding: str
+) -> None:
     ensure_parent_dir(report_path)
     fieldnames = [
         "file_path",
@@ -567,22 +644,27 @@ def write_report(report_path: str, results: List[FileResult], input_root: str, e
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for r in results:
-            writer.writerow({
-                "file_path": relative_to(r.file_path, input_root),
-                "status": r.status,
-                "idempotent": str(bool(r.idempotent)).lower(),
-                "baseline_hash": r.baseline_hash,
-                "result_hash": r.result_hash,
-                "reason": r.reason,
-                "time_ms": r.time_ms,
-                "tokens_baseline": r.tokens_baseline,
-                "tokens_result": r.tokens_result,
-                "diff_path": relative_to(r.diff_path, input_root) if r.diff_path else "",
-            })
+            writer.writerow(
+                {
+                    "file_path": relative_to(r.file_path, input_root),
+                    "status": r.status,
+                    "idempotent": str(bool(r.idempotent)).lower(),
+                    "baseline_hash": r.baseline_hash,
+                    "result_hash": r.result_hash,
+                    "reason": r.reason,
+                    "time_ms": r.time_ms,
+                    "tokens_baseline": r.tokens_baseline,
+                    "tokens_result": r.tokens_result,
+                    "diff_path": (
+                        relative_to(r.diff_path, input_root) if r.diff_path else ""
+                    ),
+                }
+            )
 
 
 def run_manager(args: argparse.Namespace) -> int:
     input_root = os.path.abspath(args.input_dir)
+    pdf_root = os.path.abspath(args.pdf_dir)
     out_root = os.path.abspath(args.output_dir)
     diffs_root = os.path.abspath(DEFAULT_DIFFS_DIR)  # fixed as required
 
@@ -591,47 +673,91 @@ def run_manager(args: argparse.Namespace) -> int:
 
     # Resolve and ensure directories (created on demand below)
     # Build list of files
-    exclude_dirs = {DEFAULT_OUTPUT_DIR, DEFAULT_DIFFS_DIR, os.path.basename(out_root), os.path.basename(diffs_root)}
-    md_files = find_markdown_files(input_root, exclude_dirs=exclude_dirs)
+    exclude_dirs = {
+        DEFAULT_OUTPUT_DIR,
+        DEFAULT_DIFFS_DIR,
+        os.path.basename(out_root),
+        os.path.basename(diffs_root),
+    }
+    md_files, pdf_files = find_input_files(
+        input_root, pdf_root, exclude_dirs=exclude_dirs
+    )
 
     # Respect limit
     if args.limit > 0:
         md_files = md_files[: args.limit]
 
+    temp_dir = tempfile.mkdtemp()
+    temp_md_files = []
+    results: List[FileResult] = []
     processed = 0
     success = 0
     failed = 0
     idemp_viol = 0
-    results: List[FileResult] = []
+    try:
+        for pdf in pdf_files:
+            try:
+                basename = os.path.basename(pdf).replace('.pdf', '_pdf.md')
+                temp_md_path = os.path.join(temp_dir, basename)
+                if args.ocr:
+                    text = pdf_to_md.pdf_to_text_ocr(pdf)
+                else:
+                    text = pdf_to_md.pdf_to_text(pdf)
+                write_text_file(temp_md_path, text, args.encoding)
+                temp_md_files.append(temp_md_path)
+            except Exception as e:
+                logging.error(f"Error converting PDF {pdf}: {e}")
+                fr = FileResult(
+                    file_path=pdf,
+                    status="failed",
+                    idempotent=False,
+                    baseline_hash="",
+                    result_hash="",
+                    reason="pdf_conversion_error",
+                    time_ms=0,
+                    tokens_baseline=0,
+                    tokens_result=0,
+                    diff_path="",
+                )
+                results.append(fr)
+                processed += 1
+                failed += 1
+        all_files = md_files + temp_md_files
 
-    for idx, src in enumerate(md_files, start=1):
-        fr = process_file(src, args, input_root, out_root, diffs_root)
-        results.append(fr)
-        processed += 1
-        if fr.status == "success":
-            success += 1
-        else:
-            failed += 1
-        if not fr.idempotent:
-            idemp_viol += 1
+        for idx, src in enumerate(all_files, start=1):
+            fr = process_file(src, args, input_root, out_root, diffs_root)
+            results.append(fr)
+            processed += 1
+            if fr.status == "success":
+                success += 1
+            else:
+                failed += 1
+            if not fr.idempotent:
+                idemp_viol += 1
 
-        # fail-fast behavior
-        if args.fail_fast and fr.status == "failed":
-            print(f"Fail-fast: stopping after first failure: {relative_to(src, input_root)}", file=sys.stderr)
-            break
+            # fail-fast behavior
+            if args.fail_fast and fr.status == "failed":
+                print(
+                    f"Fail-fast: stopping after first failure: {relative_to(src, input_root)}",
+                    file=sys.stderr,
+                )
+                break
 
-    # Write report (partial if stopped early)
-    report_path = os.path.abspath(args.report)
-    write_report(report_path, results, input_root, args.encoding)
+        # Write report (partial if stopped early)
+        report_path = os.path.abspath(args.report)
+        write_report(report_path, results, input_root, args.encoding)
 
-    # Summary
-    print("DHH Batch Clean Summary")
-    print(f"  Input dir: {input_root}")
-    print(f"  Output dir: {out_root} (dry-run={args.dry_run})")
-    print(f"  Diffs dir: {diffs_root}")
-    print(f"  Report: {report_path}")
-    print(f"  Processed: {processed}, Success: {success}, Failed: {failed}, Idempotence violations: {idemp_viol}")
-
+        # Summary
+        print("DHH Batch Clean Summary")
+        print(f"  Input dir: {input_root}")
+        print(f"  Output dir: {out_root} (dry-run={args.dry_run})")
+        print(f"  Diffs dir: {diffs_root}")
+        print(f"  Report: {report_path}")
+        print(
+            f"  Processed: {processed}, Success: {success}, Failed: {failed}, Idempotence violations: {idemp_viol}"
+        )
+    finally:
+        shutil.rmtree(temp_dir)
     return 0 if failed == 0 else 1
 
 
@@ -648,7 +774,9 @@ def _normalizer_self_checks() -> None:
 
     # Images to alt
     cases.append(("![alt text](img.png)", "alt text", "image-alt"))
-    cases.append(("![alt text][imgref]\n\n[imgref]: img.png", "alt text", "image-alt-ref"))
+    cases.append(
+        ("![alt text][imgref]\n\n[imgref]: img.png", "alt text", "image-alt-ref")
+    )
 
     # Headings and lists and quotes
     cases.append(("# Title", "title", "heading"))
@@ -661,36 +789,124 @@ def _normalizer_self_checks() -> None:
     cases.append(("```\nblock code\n```", "block code", "fenced-code"))
 
     # Footnotes: inline markers dropped, def keeps body
-    cases.append(("text with footnote[^1]\n\n[^1]: the note body", "text with footnote the note body", "footnote"))
+    cases.append(
+        (
+            "text with footnote[^1]\n\n[^1]: the note body",
+            "text with footnote the note body",
+            "footnote",
+        )
+    )
 
     # HTML tags and comments
-    cases.append(("<div>hello <span>world</span></div><!-- c -->", "hello world", "html-tags-comments"))
+    cases.append(
+        (
+            "<div>hello <span>world</span></div><!-- c -->",
+            "hello world",
+            "html-tags-comments",
+        )
+    )
 
     for src, expected_contains, name in cases:
         got = _normalize_text_for_compare(src)
         if expected_contains not in got:
-            print(f"[Normalizer self-check WARNING] Case '{name}' failed. Expected to contain '{expected_contains}', got '{got}'", file=sys.stderr)
+            print(
+                f"[Normalizer self-check WARNING] Case '{name}' failed. Expected to contain '{expected_contains}', got '{got}'",
+                file=sys.stderr,
+            )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Batch-clean Markdown with Judge-Worker-Manager content preservation.")
-    p.add_argument("--input-dir", default=DEFAULT_INPUT_DIR, help="Input directory to scan recursively for .md files (default: .)")
-    p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory to write cleaned files (default: cleaned)")
-    p.add_argument("--suffix", default=DEFAULT_SUFFIX, help="Suffix to append before extension for cleaned files (default: _clean)")
+    p = argparse.ArgumentParser(
+        description="Batch-clean Markdown with Judge-Worker-Manager content preservation."
+    )
+    p.add_argument(
+        "--input-dir",
+        default=DEFAULT_INPUT_DIR,
+        help="Input directory to scan recursively for .md files (default: .)",
+    )
+    p.add_argument(
+        "--output-dir",
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory to write cleaned files (default: cleaned)",
+    )
+    p.add_argument(
+        "--suffix",
+        default=DEFAULT_SUFFIX,
+        help="Suffix to append before extension for cleaned files (default: _clean)",
+    )
     # Mutually sensible dry-run flags
-    p.add_argument("--dry-run", dest="dry_run", action="store_true", default=DEFAULT_DRY_RUN, help="Do not write outputs (default)")
-    p.add_argument("--no-dry-run", dest="dry_run", action="store_false", help="Write outputs (overrides --dry-run)")
-    p.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="Process only first N files by sorted path; 0 means all (default: 5)")
-    p.add_argument("--fail-fast", action="store_true", default=DEFAULT_FAIL_FAST, help="Stop on first content-preservation failure (default: False)")
-    p.add_argument("--report", default=DEFAULT_REPORT, help="CSV summary report path (default: clean_report.csv)")
-    p.add_argument("--diff-context", type=int, default=DEFAULT_DIFF_CONTEXT, help="Context tokens around changes in diffs (default: 6)")
-    p.add_argument("--encoding", default=DEFAULT_ENCODING, help="File encoding for I/O (default: utf-8)")
+    p.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=DEFAULT_DRY_RUN,
+        help="Do not write outputs (default)",
+    )
+    p.add_argument(
+        "--no-dry-run",
+        dest="dry_run",
+        action="store_false",
+        help="Write outputs (overrides --dry-run)",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        help="Process only first N files by sorted path; 0 means all (default: 5)",
+    )
+    p.add_argument(
+        "--fail-fast",
+        action="store_true",
+        default=DEFAULT_FAIL_FAST,
+        help="Stop on first content-preservation failure (default: False)",
+    )
+    p.add_argument(
+        "--report",
+        default=DEFAULT_REPORT,
+        help="CSV summary report path (default: clean_report.csv)",
+    )
+    p.add_argument(
+        "--diff-context",
+        type=int,
+        default=DEFAULT_DIFF_CONTEXT,
+        help="Context tokens around changes in diffs (default: 6)",
+    )
+    p.add_argument(
+        "--encoding",
+        default=DEFAULT_ENCODING,
+        help="File encoding for I/O (default: utf-8)",
+    )
+    p.add_argument(
+        "--pdf-dir",
+        default=None,
+        help="Directory for PDF files (default: same as --input-dir)",
+    )
+    p.add_argument("--ocr", action="store_true", help="Enable OCR processing for PDFs")
+    # Optional flag to enable strict EPUB spec validation (future feature)
+    p.add_argument(
+        "--strict-epub",
+        dest="strict_epub",
+        action="store_true",
+        default=False,
+        help="Enable strict EPUB spec validation before processing (default: off)",
+    )
+    p.add_argument("--version", action="version", version=__version__)
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.ocr:
+        try:
+            import pytesseract
+            import pdf2image
+        except ImportError:
+            print("Error: OCR dependencies not installed. Please install pytesseract and pdf2image. Run: pip install pytesseract pdf2image", file=sys.stderr)
+            sys.exit(1)
+    if args.pdf_dir is None:
+        args.pdf_dir = args.input_dir
     return run_manager(args)
 
 

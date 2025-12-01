@@ -1,0 +1,24 @@
+[project]
+name = "epub_cleaner"
+version = "0.2.0"
+description = "A pragmatic, DHH-style Python tool for batch cleaning Markdown files converted from EPUBs."
+authors = [
+    {name = "Anthony Cho"},
+]
+dependencies = [
+    "pdfminer.six",
+    "pytesseract",
+    "pdf2image",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "flake8",
+    "mypy",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"

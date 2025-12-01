@@ -39,3 +39,29 @@ python3 dhh_batch_clean.py \
 - **Non-Destructive**: Never overwrites source files.
 - **Idempotent**: Running the tool multiple times on the same text produces the same result.
 - **Content Preservation**: Uses a "Judge" (Normalizer) to ensure no meaningful content is lost during cleaning.
+
+## PDF Support
+
+The tool now accepts PDF files in addition to Markdown. PDFs are converted to Markdown temporarily and then processed like regular MD files.
+
+### New CLI Flags
+
+- `--pdf-dir`: Directory containing PDF files (default: same as `--input-dir`)
+- `--ocr`: Enable OCR processing for scanned PDFs
+
+### Dependencies
+
+- **Mandatory**: `pdfminer.six`
+- **Optional**: `pytesseract` and `pdf2image` (required for OCR functionality)
+
+### Usage Example
+
+```bash
+python3 dhh_batch_clean.py \
+  --input-dir "/path/to/raw/files" \
+  --pdf-dir "/path/to/pdf/files" \
+  --output-dir "/path/to/Obsidian/Vault/Cleaned" \
+  --ocr \
+  --no-dry-run \
+  --limit 0
+```
